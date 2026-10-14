@@ -1,0 +1,102 @@
+<?php
+
+# Required File Includes
+include("../../../init.php");
+include("../../../includes/functions.php");
+include("../../../includes/gatewayfunctions.php");
+include("../../../includes/invoicefunctions.php");
+
+
+global $CONFIG;
+
+$gatewaymodule = "rms"; # Enter your gateway module name here replacing template
+
+$GATEWAY = getGatewayVariables($gatewaymodule);
+if (!$GATEWAY["type"]) die("Module Not Activated"); # Checks gateway module is active before accepting callback
+
+# Get Returned Variables
+
+$_POST['treq'] = 1;
+$nbcb = $_POST['nbcb'];
+
+ $transid = $_POST['tranID'];
+ $orderid = $_POST['orderid'];	
+ $status = $_POST['status'];
+ $domain = $_POST['domain'];
+ $amount = $_POST['amount'];
+ $currency = $_POST['currency'];
+ $appcode = $_POST['appcode'];
+ $paydate = $_POST['paydate'];
+ $skey = $_POST['skey'];
+ $cust_name = $_POST['cust_name'];
+ $cust_email = $_POST['email'];
+ $passwd = $GATEWAY['secretkey'];
+
+// Check if the current $skey is the same as the one stored in the session
+session_start();
+if (isset($_SESSION['prev_skey']) && $_SESSION['prev_skey'] === $skey) {
+    die("Duplicate response. Request terminated.");
+} else {
+    $_SESSION['prev_skey'] = $skey;
+}
+ 
+ if($nbcb == 1)
+{
+	echo "CBTOKEN:MPSTATOK";
+}
+else
+{
+	foreach ($_POST as $k => $v) 
+	{
+	    $postData[] = $k . "=" . $v;
+	}
+	$postdata =implode("&",$postData);
+	$url	="https://pay.merchant.razer.com/RMS/API/chkstat/returnipn.php";
+	$ch 	=curl_init();
+	curl_setopt($ch, CURLOPT_POST , 1 );
+	curl_setopt($ch, CURLOPT_POSTFIELDS , $postdata );
+	curl_setopt($ch, CURLOPT_URL , $url );
+	curl_setopt($ch, CURLOPT_HEADER , 1 );
+	curl_setopt($ch, CURLINFO_HEADER_OUT , TRUE );
+	curl_setopt($ch, CURLOPT_RETURNTRANSFER , 1 );
+	curl_setopt($ch, CURLOPT_SSL_VERIFYPEER , FALSE);
+	$result = curl_exec( $ch );
+	curl_close( $ch );
+}
+ 
+  $key0 = md5($tranID.$orderid.$status.$domain.$amount.$currency);
+  $key1 = md5($paydate.$domain.$key0.$appcode.$passwd);
+
+  if ( $skey != $key1 ) $status = -1;
+
+ $viewinvoice = $CONFIG['SystemURL']."/viewinvoice.php?id=".$orderid;
+ $clientarea = $CONFIG['SystemURL']."/clientarea.php?action=invoices";
+
+$invoiceid = checkCbInvoiceID($orderid,$GATEWAY["name"]); # Checks invoice ID is a valid invoice number or ends processing
+
+//checkCbTransID($transid); # Checks transaction number isn't already in the database and ends processing if it does
+
+
+if ($status=="00") {
+    # Successful
+    
+    $checkResult = select_query("tblaccounts", "COUNT(*)", array("transid" => $transid));
+    $checkData = mysql_fetch_array($checkResult);
+	
+    if ($checkData[0]) {
+	header("Location: ".$viewinvoice);
+	exit();
+    }
+    
+    addInvoicePayment($invoiceid,$transid,$amount,$fee,$gatewaymodule);
+    logTransaction($GATEWAY["name"],$_POST,"Successful");
+    header('Location: '.$viewinvoice);
+	
+		
+} else {
+	# Unsuccessful
+    logTransaction($GATEWAY["name"],$_POST,"Unsuccessful");
+    header('Location: '.$clientarea);
+}
+
+?>
