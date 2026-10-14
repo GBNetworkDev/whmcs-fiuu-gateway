@@ -47,6 +47,9 @@ invoice.
 This follows the WHMCS developer guidance (Payment Gateways > Callback Files): record payments via the
 server-to-server callback, and return the visitor to the Client Area with a same-site navigation.
 
+**Upstream PR:** https://github.com/FiuuPayment/Shopping-Cart-Plugins-Fiuu_WHMCS/pull/4 (same fix, rebased on upstream
+master). Once it is merged and released, a vendor update no longer needs this patch.
+
 **Rollback:** restore the `vendor-6.1` version of `return/fiuu_return.php`.
 
 ## Updating the vendor plugin
