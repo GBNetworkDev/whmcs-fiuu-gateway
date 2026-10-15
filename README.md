@@ -58,3 +58,21 @@ master). Once it is merged and released, a vendor update no longer needs this pa
 3. Re-apply the GB patches.
 4. Run `php -l`.
 5. Run a RM1 Fiuu test (DuitNow QR) and confirm the customer lands on the Paid invoice while still logged in.
+
+
+## GB patch 2: charge the current amount, not the page-render amount (2026-10-15)
+**Symptom:** invoice set to Fiuu, customer switches the payment method (e.g. Credit Card) and clicks "Make Payment"
+before the page reloads. Fiuu opens anyway, the customer pays, and the invoice stays Unpaid with a gateway fee
+outstanding. CHIP shows an error instead.
+
+**Root cause:** the vendor `rms_link()` prints a form that POSTs straight to `pay.fiuu.com` with the amount and
+`vcode` computed when the page was rendered. Changing the method submits the gateway form and the fee module adds
+the new method's fee, but the old Fiuu button is still clickable and posts the old amount. CHIP is not affected
+because its button goes through `chip/redirect.php`, which re-reads the invoice at click time.
+
+**Fix:** `rms_link()` prints a same-origin button to `fiuu/redirect.php?invoiceid=<id>&t=<hmac>`. That page re-reads
+the invoice, refuses unless it is Unpaid and still `rms`, then auto-POSTs to Fiuu with the current balance and a
+fresh `vcode`. The notify/return/callback files are unchanged.
+
+**Rollout:** copy `fiuu/config.php.example` to `fiuu/config.php`. Start with `mode => 'clients'` (test client only),
+then `all`. Delete `config.php` or set `off` to roll back instantly.

@@ -14,6 +14,12 @@ function rms_config() {
 function rms_link($params) {
 global $CONFIG;
 
+	# GB patch 2: send the button to our click-time redirect (fresh amount + method check) when enabled.
+	require_once __DIR__ . '/fiuu/lib.php';
+	if (gbfiuu_enabled_for($params['clientdetails']['userid'] ?? ($params['clientdetails']['id'] ?? 0), gbfiuu_config())) {
+		return gbfiuu_button_html($params['invoiceid'], $params, $CONFIG['SystemURL']);
+	}
+
 	# Gateway Specific Variables
 	$merchantid = $params['merchantid'];
 	$verifykey = $params['verifykey'];

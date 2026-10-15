@@ -1,0 +1,9 @@
+<?php
+// Copy to config.php (same directory) to enable GB patch 2.
+// mode: 'off'     -> vendor behaviour (form posts straight to Fiuu with the page-render amount)
+//       'clients' -> click-time redirect only for the client IDs listed below (canary)
+//       'all'     -> click-time redirect for every client
+return array(
+    'mode' => 'clients',
+    'clients' => array(20925),
+);
