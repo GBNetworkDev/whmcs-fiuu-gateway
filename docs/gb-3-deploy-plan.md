@@ -65,6 +65,8 @@ RewriteRule ^modules/gateways/ - [E=noabort:1,E=noconntimeout:1]
    `Already recorded`. Before the patch this created duplicates.
    (The concurrency logic is already tested against MariaDB 11.4 in `tests/race_test.php`. The vendor logic recorded
    5 of 5 parallel requests; the patched logic recorded 1 of 5.)
+   Also replay once more while test 1's notify is still inside its hooks (before the e_invoice fix this is ~80 s):
+   the replay must return within a second or two (fast path), not hang for 60 s.
 4. **Daily monitor (SQL, read-only).** Both queries should return 0 rows:
 ```
 -- mass-pay parent Paid but a child still Unpaid

@@ -161,12 +161,36 @@ $res = run_parallel(2, function ($i) {
         usleep(300 * 1000);
     }
     $pdo = db();
+    // Holder is slow BEFORE its row exists (e.g. WHMCS still loading the invoice), so the waiter cannot take the fast path.
+    $slowFirst = function ($inv, $tid, $amt, $fee, $gw) use ($pdo) {
+        usleep(3000 * 1000);
+        $pdo->prepare('INSERT INTO tblaccounts (invoiceid, transid, amountin, gateway) VALUES (?,?,?,?)')->execute(array($inv, $tid, $amt, $gw));
+    };
     return gbfiuu_record_payment(
         array('invoiceid' => 1, 'transid' => 'SLOW', 'amount' => '1.00', 'gateway' => 'rms', 'gatewayname' => 'Fiuu', 'log' => array()),
-        array('pdo' => $pdo, 'addPayment' => fake_add_payment($pdo, 4000), 'log' => function () {}, 'lockWait' => 1)
+        array('pdo' => $pdo, 'addPayment' => $slowFirst, 'log' => function () {}, 'lockWait' => 1)
     );
 });
 check('waiter returns busy after lockWait, holder records once', $res === array('recorded', 'busy') && count_rows('SLOW') === 1, implode(',', $res));
+
+// 5b. Fast path: row already inserted, holder still in hooks (Bukku ~80 s in prod). A retry / browser return must answer
+//     'duplicate' at once, not sit on GET_LOCK for lockWait seconds.
+reset_table();
+$t = array();
+$res = run_parallel(2, function ($i) {
+    if ($i === 1) {
+        usleep(500 * 1000);
+    }
+    $pdo = db();
+    $t0 = microtime(true);
+    $r = gbfiuu_record_payment(
+        array('invoiceid' => 1, 'transid' => 'INHOOKS', 'amount' => '1.00', 'gateway' => 'rms', 'gatewayname' => 'Fiuu', 'log' => array()),
+        array('pdo' => $pdo, 'addPayment' => fake_add_payment($pdo, 5000), 'log' => function () {}, 'lockWait' => 30)
+    );
+    return $r . '@' . round(microtime(true) - $t0, 1);
+});
+$waitSec = (float) substr($res[1], strpos($res[1], '@') + 1);
+check('retry during hooks returns duplicate at once (fast path), 1 row', strpos($res[0], 'recorded@') === 0 && strpos($res[1], 'duplicate@') === 0 && $waitSec < 1.0 && count_rows('INHOOKS') === 1, implode(',', $res));
 
 // 6. Log order: gateway log written BEFORE addInvoicePayment, so a crash inside hooks still leaves a log entry.
 reset_table();
@@ -181,6 +205,33 @@ check('log written before addInvoicePayment; hook exception is logged, not fatal
 
 // 7. Lock name fits MariaDB's 64-char limit.
 check('lock name <= 64 chars', strlen(gbfiuu_lock_name(str_repeat('9', 300))) <= 64);
+
+// 8. Time limit is raised, never lowered (production runs with 700 s; 0 = unlimited stays unlimited).
+$orig = ini_get('max_execution_time');
+ini_set('max_execution_time', '700'); gbfiuu_raise_time_limit(600); $a = ini_get('max_execution_time');
+ini_set('max_execution_time', '0');   gbfiuu_raise_time_limit(600); $b = ini_get('max_execution_time');
+ini_set('max_execution_time', '300'); gbfiuu_raise_time_limit(600); $c = ini_get('max_execution_time');
+ini_set('max_execution_time', $orig);
+check('time limit 700 stays 700, 0 stays 0, 300 becomes 600', $a === '700' && $b === '0' && $c === '600', "$a,$b,$c");
+
+// 9. If the DB connection dies during hooks, RELEASE_LOCK fails but the result is kept ('recorded', no exception).
+reset_table();
+$pdo = db();
+$killer = db();
+$r = 'exception';
+try {
+    $r = gbfiuu_record_payment(
+        array('invoiceid' => 3, 'transid' => 'CONNLOST', 'amount' => '1.00', 'gateway' => 'rms', 'gatewayname' => 'Fiuu', 'log' => array()),
+        array('pdo' => $pdo, 'addPayment' => function ($inv, $tid, $amt) use ($pdo, $killer) {
+            $pdo->prepare('INSERT INTO tblaccounts (invoiceid, transid, amountin, gateway) VALUES (?, ?, ?, ?)')->execute(array($inv, $tid, $amt, 'rms'));
+            $killer->exec('KILL CONNECTION ' . (int) $pdo->query('SELECT CONNECTION_ID()')->fetchColumn());
+        }, 'log' => function () {}, 'lockWait' => 1)
+    );
+} catch (\Throwable $e) {
+    $r = 'exception: ' . $e->getMessage();
+}
+$free = (int) db()->query("SELECT IS_FREE_LOCK('" . gbfiuu_lock_name('CONNLOST') . "')")->fetchColumn();
+check('connection lost during hooks: result kept, lock freed, 1 row', $r === 'recorded' && $free === 1 && count_rows('CONNLOST') === 1, "$r free=$free");
 
 echo $fail ? "\n$fail FAILED\n" : "\nALL PASSED\n";
 exit($fail ? 1 : 0);

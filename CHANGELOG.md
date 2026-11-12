@@ -8,7 +8,20 @@
   by notify, both callbacks and return.
 - Mass payment half applied (INV-1017375, 2 of 5 child invoices), gateway side only. The gateway log is now written
   before `addInvoicePayment()`, so an accepted payment is always visible even if a hook fails later.
-  `ignore_user_abort(true)` and `set_time_limit(600)` keep the request running if Fiuu hangs up.
+  `ignore_user_abort(true)` keeps the request running if Fiuu hangs up, and the time limit is raised to 600 s but
+  never lowered (production already runs with 700 s).
+
+### Double review (2026-11-12, second commit)
+- Time limit: the first version called `set_time_limit(600)`, which would have LOWERED production's 700 s limit
+  (`.user.ini`/`php.ini`). Now `gbfiuu_raise_time_limit()` only raises it; 0 (unlimited) is left alone.
+- Fast path: a duplicate (Fiuu retry or the customer's browser return) that arrives while the first request is still
+  inside the ~80 s InvoicePaid hooks used to wait up to 60 s on `GET_LOCK`, holding a PHP worker and keeping the
+  customer waiting on the return page. It now checks `tblaccounts` first and answers `duplicate` at once (WHMCS writes the row
+  at the start of `addInvoicePayment()`). The check inside the lock is kept, so the race fix is unchanged.
+- `RELEASE_LOCK` failing (DB connection lost during a long hook) could throw from `finally` and replace the result
+  with a fatal error. It is now caught; MariaDB frees the lock with the connection anyway.
+- Confirmed safe: catching a hook exception after `addInvoicePayment()` does not lose the payment. Production
+  #146795 (10 Jul 2026, SolusVM hook TypeError inside fiuu_notify) still has its tblaccounts row and is Paid.
 
 ### Root cause outside this module (not in this repo)
 - What actually stopped INV-1017375 was the e_invoice addon's InvoicePaid hook, which ran a Bukku sync inline for
@@ -27,7 +40,8 @@
 - `tests/race_test.php` on MariaDB 11.4: the vendor code records the same tranID 5x (bug reproduced); the patched
   code records it once (1 recorded + 4 duplicate). Different tranIDs are not serialised, the lock is released when the
   holder is killed, a waiter returns `busy` after lockWait, and a hook exception is logged instead of being fatal.
-  8/8 pass.
+  After the double review: 11/11 pass. The 3 new tests (time limit not lowered, fast path during hooks, connection
+  lost during hooks) fail on the first commit 22deda6 and pass on the fix.
 - Base files in git match production byte-for-byte (sha256) for the four endpoints, `rms.php`, `fiuu/lib.php` and
   `fiuu/redirect.php`.
 

@@ -1,6 +1,7 @@
 <?php
 /**
- * GB patch 3: record each Fiuu transaction exactly once, and do not leave a payment half processed.
+ * GB patch 3: record each Fiuu transaction exactly once, and always leave a gateway log for an accepted payment.
+ * (Finishing a half-applied mass pay is NOT done here; that needs the e_invoice fix, see below.)
  *
  * Production incidents (Nov 2026):
  *  1. Double payment, INV-1017315 (tranID 4166432931). Fiuu sent the notify three times in the same second, from two
@@ -16,7 +17,12 @@
  *  - Serialise per tranID with a MariaDB named lock (GET_LOCK) and do the "already recorded?" check inside the lock.
  *    The lock is tied to the DB connection, so it is released even if PHP dies.
  *  - Write the gateway log BEFORE addInvoicePayment(), so every accepted payment is visible even if a hook fails.
- *  - ignore_user_abort(true) and a longer time limit, so the request is not cut off if Fiuu hangs up.
+ *  - ignore_user_abort(true), and raise (never lower) the time limit to 600 s, so the request is not cut off if Fiuu
+ *    hangs up.
+ *  - A hook exception inside addInvoicePayment() is caught and logged. This is safe: WHMCS has already committed the
+ *    tblaccounts row and marked the invoice Paid by then (checked on #146795, 10 Jul 2026, SolusVM hook TypeError).
+ *  - The COUNT check runs in autocommit (WHMCS commits each statement, which is why rows survive a dead request), so it
+ *    sees rows committed by the previous lock holder.
  * The slow InvoicePaid hook itself belongs to the e_invoice addon and is fixed there, not here
  * (GBNetworkDev/whmcs-einvoice#1: deferred, batched Bukku sync). This module contains no e_invoice/Bukku code.
  *
@@ -29,6 +35,19 @@ if (!function_exists('gbfiuu_record_payment')) {
     function gbfiuu_lock_name($transid)
     {
         return 'gbfiuu_tx_' . substr(hash('sha256', (string) $transid), 0, 40);
+    }
+
+    /**
+     * Raise max_execution_time to $seconds, but never lower it. Production WHMCS runs with 700 s (php.ini/.user.ini),
+     * so a plain set_time_limit(600) would shorten it. 0 means unlimited and is left alone.
+     */
+    function gbfiuu_raise_time_limit($seconds)
+    {
+        $current = (int) ini_get('max_execution_time');
+        if ($current === 0 || $current >= $seconds || !function_exists('set_time_limit')) {
+            return false;
+        }
+        return @set_time_limit($seconds);
     }
 
     /**
@@ -60,8 +79,16 @@ if (!function_exists('gbfiuu_record_payment')) {
 
         // Finish the job even if Fiuu (or the customer's browser) disconnects while hooks run.
         ignore_user_abort(true);
-        if (function_exists('set_time_limit')) {
-            @set_time_limit(600);
+        gbfiuu_raise_time_limit(600);
+
+        // Fast path: WHMCS inserts the tblaccounts row at the start of addInvoicePayment(), long before the hooks finish.
+        // A retry or the customer's browser return that comes in while the first request is still in hooks can stop
+        // here instead of waiting up to $lockWait seconds for the lock. The check is repeated inside the lock.
+        $st = $pdo->prepare('SELECT COUNT(*) FROM tblaccounts WHERE transid = ?');
+        $st->execute(array($transid));
+        if ((int) $st->fetchColumn() > 0) {
+            $log($p['gatewayname'], $logData, 'Already recorded (duplicate ignored)');
+            return 'duplicate';
         }
 
         $lock = gbfiuu_lock_name($transid);
@@ -90,8 +117,12 @@ if (!function_exists('gbfiuu_record_payment')) {
             }
             return 'recorded';
         } finally {
-            $st = $pdo->prepare('SELECT RELEASE_LOCK(?)');
-            $st->execute(array($lock));
+            // Never let the unlock replace the result: if the connection is gone, MariaDB has already freed the lock.
+            try {
+                $st = $pdo->prepare('SELECT RELEASE_LOCK(?)');
+                $st->execute(array($lock));
+            } catch (\Throwable $e) {
+            }
         }
     }
 }
