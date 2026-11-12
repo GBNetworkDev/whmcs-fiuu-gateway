@@ -270,6 +270,39 @@ check('should_ack: recorded/duplicate/error/invalid yes; busy/not_recorded no',
     gbfiuu_should_ack('recorded') && gbfiuu_should_ack('duplicate') && gbfiuu_should_ack('error') && gbfiuu_should_ack('invalid')
     && !gbfiuu_should_ack('busy') && !gbfiuu_should_ack('not_recorded'));
 
+// 7e. Review 2 / M1: a waiter that arrived BEFORE the holder inserted, while the holder stays in hooks longer than
+//     lockWait, must answer 'duplicate' (row exists), not 'busy' + a false "not recorded" alert.
+reset_table();
+$res = run_parallel(2, function ($i) {
+    $pdo = db();
+    if ($i === 1) {
+        usleep(20 * 1000); // arrive just after the holder took the lock, before its insert (insert happens after 50 ms)
+    }
+    $alerts = 0;
+    $r = gbfiuu_record_payment(
+        array('invoiceid' => 8, 'transid' => 'WAITER', 'amount' => '1.00', 'gateway' => 'rms', 'gatewayname' => 'Fiuu', 'log' => array()),
+        array('pdo' => $pdo, 'addPayment' => fake_add_payment($pdo, 3000), 'log' => function () {},
+            'alert' => function () use (&$alerts) { $alerts++; }, 'lockWait' => 1)
+    );
+    return $r . ($alerts ? '+alert' : '');
+});
+sort($res);
+check('waiter times out while the row already exists -> duplicate, no alert, 1 row', $res === array('duplicate', 'recorded') && count_rows('WAITER') === 1, implode(',', $res));
+
+// 7f. Review 2 / L2: addInvoicePayment returns false AND the re-check cannot run (connection lost) -> not_recorded, no ack.
+reset_table();
+$pdo = db();
+$alerts = array();
+$r = gbfiuu_record_payment(
+    array('invoiceid' => 9, 'transid' => 'FALSELOST', 'amount' => '1.00', 'gateway' => 'rms', 'gatewayname' => 'Fiuu', 'log' => array()),
+    array('pdo' => $pdo, 'addPayment' => function () use ($pdo) {
+        $id = (int) $pdo->query('SELECT CONNECTION_ID()')->fetchColumn();
+        db()->exec("KILL $id"); // another connection kills ours, like a DB restart inside the hooks
+        return false;
+    }, 'log' => function () {}, 'alert' => function ($m) use (&$alerts) { $alerts[] = $m; }, 'lockWait' => 1)
+);
+check('false return + lost connection -> not_recorded (no ack), alert raised', $r === 'not_recorded' && !gbfiuu_should_ack($r) && count($alerts) === 1, $r);
+
 // 8. Time limit is raised, never lowered (production runs with 700 s; 0 = unlimited stays unlimited).
 $orig = ini_get('max_execution_time');
 ini_set('max_execution_time', '700'); gbfiuu_raise_time_limit(600); $a = ini_get('max_execution_time');

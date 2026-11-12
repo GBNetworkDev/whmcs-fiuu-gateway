@@ -39,7 +39,7 @@ if (session_status() == PHP_SESSION_NONE) {
 if (isset($_SESSION['prev_skey']) && $_SESSION['prev_skey'] === $skey) {
     exit("Duplicate response. Request terminated.");
 }
-$_SESSION['prev_skey'] = $skey;
+# GB patch 3: prev_skey is saved only after Fiuu is acknowledged (below), so a 503 retry is not dropped here.
  
  if($nbcb == 1)
 {
@@ -84,6 +84,8 @@ if ($status=="00") {
     
     # --- GB Network patch 3: record each tranID once (lock + check inside the lock); see fiuu/gb_payment.php ---
     require_once __DIR__ . '/../fiuu/gb_payment.php';
+    $gbfiuu_ob = ob_get_level();
+    ob_start(); # GB patch 3: hook/WHMCS output must not precede the ack or the 503
     $gbfiuu_result = gbfiuu_record_payment(array(
         'invoiceid' => $invoiceid,
         'transid' => $transid,
@@ -92,11 +94,12 @@ if ($status=="00") {
         'gatewayname' => $GATEWAY["name"],
         'log' => $_POST,
     ));
+    gbfiuu_discard_output($gbfiuu_ob);
     if (!gbfiuu_should_ack($gbfiuu_result)) {
         # Not recorded yet: no CBTOKEN, so Fiuu retries the callback (up to 3 times, 15 min apart).
-        http_response_code(503);
-        exit("RETRY");
+        gbfiuu_respond_retry();
     }
+    $_SESSION['prev_skey'] = $skey;
     if (!empty($gbfiuu_cb_ack)) {
         echo "CBTOKEN:MPSTATOK";
         exit;
@@ -108,6 +111,7 @@ if ($status=="00") {
 } else {
 	# Unsuccessful
     logTransaction($GATEWAY["name"],$_POST,"Unsuccessful");
+    $_SESSION['prev_skey'] = $skey; # GB patch 3: saved after processing, not before
     if (!empty($gbfiuu_cb_ack)) { echo "CBTOKEN:MPSTATOK"; exit; } # GB patch 3: ack after processing
     header('Location: '.$clientarea);
 }

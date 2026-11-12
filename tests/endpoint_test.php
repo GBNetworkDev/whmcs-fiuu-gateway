@@ -48,9 +48,14 @@ function events($type)
     return $pdo->query("SELECT text FROM testlog WHERE type = " . $pdo->quote($type) . " ORDER BY id")->fetchAll(PDO::FETCH_COLUMN);
 }
 
-$port = 8099;
-$server = proc_open(array(PHP_BINARY, '-S', "127.0.0.1:$port", '-t', $root), array(1 => array('file', '/dev/null', 'w'), 2 => array('file', "$root/server.log", 'w')), $pipes);
-usleep(800 * 1000);
+$sock = stream_socket_server('tcp://127.0.0.1:0');
+$port = (int) substr(strrchr(stream_socket_get_name($sock, false), ':'), 1);
+fclose($sock);
+$server = proc_open(array(PHP_BINARY, '-d', 'display_errors=1', '-S', "127.0.0.1:$port", '-t', $root),
+    array(1 => array('file', '/dev/null', 'w'), 2 => array('file', "$root/server.log", 'w')), $pipes);
+for ($i = 0; $i < 50 && !@fsockopen('127.0.0.1', $port, $en, $es, 0.1); $i++) {
+    usleep(100 * 1000);
+}
 
 /** Signed Fiuu POST like the real gateway sends (skey per Fiuu spec). */
 function fiuu_fields($invoice, $tranID, $status = '00', $extra = array(), $secret = 'TESTSECRET')
@@ -62,10 +67,11 @@ function fiuu_fields($invoice, $tranID, $status = '00', $extra = array(), $secre
     return array_merge($f, $extra);
 }
 
-function post($path, array $fields)
+function post($path, array $fields, &$cookie = null)
 {
     global $port;
-    $ctx = stream_context_create(array('http' => array('method' => 'POST', 'header' => 'Content-Type: application/x-www-form-urlencoded',
+    $hdr = 'Content-Type: application/x-www-form-urlencoded' . ($cookie ? "\r\nCookie: $cookie" : '');
+    $ctx = stream_context_create(array('http' => array('method' => 'POST', 'header' => $hdr,
         'content' => http_build_query($fields), 'follow_location' => 0, 'ignore_errors' => true, 'timeout' => 90)));
     $body = @file_get_contents("http://127.0.0.1:$port/$path", false, $ctx);
     $code = 0;
@@ -76,6 +82,9 @@ function post($path, array $fields)
         }
         if (stripos($h, 'Location:') === 0) {
             $loc = trim(substr($h, 9));
+        }
+        if (func_num_args() > 2 && preg_match('/^Set-Cookie:\s*([^;]+)/i', $h, $m)) {
+            $cookie = $m[1];
         }
     }
     return array('code' => $code, 'body' => (string) $body, 'loc' => $loc);
@@ -173,11 +182,29 @@ check('return after notify -> 302 viewinvoice, still 1 row', $r['code'] === 302 
 $r = post($T, fiuu_fields(9001, '5000000012', '00', array('gb_bounced' => 1)));
 check('return when not recorded -> customer still redirected to the invoice (302), server notify will retry', $r['code'] === 302 && rows('5000000012') === 0, d($r));
 
+// Review 2 / L3: hook output and notices must not end up before the ack
+reset_db();
+$r = post($C, fiuu_fields(9005, '5000000013', '00', array('nbcb' => 1)));
+check('callback: hook prints output + notice -> body is still exactly CBTOKEN:MPSTATOK', $r['code'] === 200 && trim($r['body']) === 'CBTOKEN:MPSTATOK' && rows('5000000013') === 1, d($r));
+$r = post($N, fiuu_fields(9005, '5000000014', '00', array('nbcb' => 2)));
+check('notify: hook prints output -> still a clean 302 redirect', $r['code'] === 302 && strpos($r['loc'], 'viewinvoice.php?id=9005') !== false && rows('5000000014') === 1, d($r));
+
+// Review 2 / L1: a retry of a 503 that carries the same session cookie must not be dropped as "Duplicate response"
+reset_db();
+$jar = null;
+$f = fiuu_fields(9006, '5000000015', '00', array('nbcb' => 1));
+$r1 = post($C, $f, $jar);
+$r2 = post($C, $f, $jar);
+check('callback 503, then retry with the same session cookie -> recorded + CBTOKEN (not "Duplicate response")',
+    $r1['code'] === 503 && trim($r2['body']) === 'CBTOKEN:MPSTATOK' && rows('5000000015') === 1, d($r1) . ' / ' . d($r2) . ' cookie=' . ($jar ? 'yes' : 'no'));
+$r3 = post($C, $f, $jar);
+check('third identical callback (same cookie) after success -> vendor dedupe still works, still 1 row', rows('5000000015') === 1 && strpos($r3['body'], 'Duplicate response') !== false, d($r3));
+
 proc_terminate($server);
 $errs = trim(@file_get_contents("$root/server.log"));
 $php_errors = preg_match_all('/PHP (Fatal|Warning|Parse|Deprecated)[^\n]*/', $errs, $m) ? $m[0] : array();
 // Pre-existing vendor reads of optional POST fields (e.g. no nbcb on a browser return) are not ours to fix here.
-$php_errors = array_values(array_filter($php_errors, function ($e) { return !preg_match('/Undefined array key "(nbcb|cust_name|email)"/', $e); }));
+$php_errors = array_values(array_filter($php_errors, function ($e) { return !preg_match('/Undefined array key "(nbcb|cust_name|email)"|simulated hook notice/', $e); }));
 check('no PHP fatal/warning/deprecated in the endpoints', !$php_errors, implode(' | ', array_slice($php_errors, 0, 3)));
 exec('rm -rf ' . escapeshellarg($root));
 echo $fail ? "\n$fail FAILED\n" : "\nALL PASSED\n";

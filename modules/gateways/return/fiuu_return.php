@@ -80,6 +80,8 @@ if ($status=="00") {
     
     # --- GB Network patch 3: record each tranID once (lock + check inside the lock); see fiuu/gb_payment.php ---
     require_once __DIR__ . '/../fiuu/gb_payment.php';
+    $gbfiuu_ob = ob_get_level();
+    ob_start(); # GB patch 3: hook/WHMCS output must not precede the ack or the 503
     $gbfiuu_result = gbfiuu_record_payment(array(
         'invoiceid' => $invoiceid,
         'transid' => $transid,
@@ -88,6 +90,7 @@ if ($status=="00") {
         'gatewayname' => $GATEWAY["name"],
         'log' => $_POST,
     ));
+    gbfiuu_discard_output($gbfiuu_ob);
     # Browser return: always send the customer to the invoice; the server notify/callback is authoritative.
     # --- end GB Network patch 3 ---
     header('Location: '.$viewinvoice);

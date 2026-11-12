@@ -48,9 +48,13 @@ find $W/modules/gateways -name .htaccess    # must print nothing: a nested .htac
 ## 2. Deploy (Fiuu gateway)
 ```
 PHP=/opt/cpanel/ea-php82/root/usr/bin/php; FILES="fiuu/gb_payment.php notify/fiuu_notify.php callback/fiuu_callback.php callback/rms_callback.php return/fiuu_return.php"
-for f in $FILES; do $PHP -l modules/gateways/$f || exit 1; done          # lint BEFORE copying, gb_payment.php included
+# Run as a script (bash deploy.sh), not pasted into the root shell: a failed step stops the script, not your session.
+set -e
+for f in $FILES; do $PHP -l modules/gateways/$f; done              # lint BEFORE copying, gb_payment.php included
+STAGE=/root/fiuu-gb3-stage-$TS; mkdir -p $STAGE                     # staged outside the docroot (never web-served)
+for f in $FILES; do install -D -o gbnet -g gbnet -m 644 modules/gateways/$f $STAGE/$f; done
 install -d -o gbnet -g gbnet -m 755 $W/modules/gateways/fiuu
-for f in $FILES; do install -o gbnet -g gbnet -m 644 modules/gateways/$f $W/modules/gateways/$f.gbnew && mv -f $W/modules/gateways/$f.gbnew $W/modules/gateways/$f; done
+for f in $FILES; do mv -f $STAGE/$f $W/modules/gateways/$f; done   # same filesystem as /home? if not, cp -p then mv in place
 for f in $FILES; do cmp modules/gateways/$f $W/modules/gateways/$f && $PHP -l $W/modules/gateways/$f; done   # deployed == git
 ```
 **Mandatory (until whmcs-einvoice#1 is live, see Scope):** stop LiteSpeed from killing gateway scripts when Fiuu
@@ -63,7 +67,23 @@ RewriteEngine On
 RewriteRule ^modules/gateways/ - [E=noabort:1,E=noconntimeout:1]
 </IfModule>
 ```
-Then reload lsphp so OPcache picks up the new files immediately (or wait for OPcache revalidation).
+Then make lsphp pick up the new files: `touch` them (OPcache revalidates on mtime) or, if OPcache
+`validate_timestamps` is off, run a graceful LiteSpeed restart (`/usr/local/lsws/bin/lswsctrl restart`, a few seconds).
+Check with one GET of `notify/fiuu_notify.php` (it should still answer, no 500) and the error_log.
+
+**Behaviour changes to know (review 2):**
+- Fiuu gets HTTP 503 (no 302, no CBTOKEN) only when the payment is not recorded yet: a lock timeout with no row, or
+  addInvoicePayment failing before the insert. Each 503 writes an admin activity-log line `Fiuu: tranID ... not
+  recorded ...` that tells staff to requery the tranID in the Fiuu portal and record it by hand if it is still unpaid
+  45 min later. Fiuu documents retries for the **callback URL** (no `CBTOKEN:MPSTATOK` ack: up to 3 more tries,
+  15 min apart). Whether Fiuu also retries a **notify** on 503 is not documented, so treat a notify 503 alert as manual.
+- Callbacks now send `CBTOKEN:MPSTATOK` after processing. A callback for an unknown invoice (`checkCbInvoiceID` stops
+  the script) is therefore not acknowledged and Fiuu retries it up to 3 times; harmless, it just adds
+  `Invoice ID Not Found` lines. A callback without `nbcb=1` still posts the vendor IPN to Fiuu before recording, so
+  Fiuu treats it as delivered regardless of a 503 (vendor behaviour, unchanged).
+- The vendor `$_SESSION['prev_skey']` duplicate guard now saves the skey only after Fiuu is acknowledged, so a retry
+  of a 503 is not dropped as "Duplicate response".
+- Output printed by WHMCS or hooks during recording is discarded, so the ack/redirect stays clean.
 
 ## 3. Validation (use a test client and RM1 invoices, clearly marked [TEST])
 1. **Single payment.** Pay a RM1 invoice through Fiuu (DuitNow QR or FPX). Expected results:
@@ -103,7 +123,9 @@ SELECT date, description FROM tblactivitylog WHERE description LIKE 'Fiuu: tranI
 ```
 for f in notify/fiuu_notify.php callback/fiuu_callback.php callback/rms_callback.php return/fiuu_return.php; do
   cp -p $B/$(basename $f) $W/modules/gateways/$f; done
-cp -p $B/.htaccess $W/.htaccess          # removes the LiteSpeed rule
+# Remove only the GB patch 3 lines from .htaccess (do NOT copy the old file back: that would also undo any WHMCS
+# friendly-URL changes made since the backup). Delete the block from "# GB patch 3: let Fiuu gateway requests finish"
+# to its "</IfModule>".
 # fiuu/gb_payment.php may stay: nothing includes it after the endpoints are restored. Then reload lsphp.
 ```
 No database changes are made by the patch.
@@ -111,6 +133,11 @@ No database changes are made by the patch.
 ## 5. Staging checks (before production)
 On a WHMCS 8.13.3 staging with the module installed and a dummy merchant secret (outbound email off, provisioning
 servers, registrars and notifications disabled, test client with plain line items only):
+0. Done on staging 12 Nov 2026 (mystaging, WHMCS 8.13.3, Apache, dummy merchant, 748225f + whmcs-einvoice#1):
+   single 302/1 row; 5x parallel notify 1 row, all <0.7 s; lock held by hand 503 after 60 s then the retry records;
+   return+notify together 1 row; callback CBTOKEN after recording; 3-child mass pay all Paid, credit 0; bad skey
+   rejected; e-invoice sync ran after the response (notify 0.8 s). Not testable there: the LiteSpeed rule (staging runs
+   Apache), and Bukku write calls (the sandbox token is read-only).
 1. Log the `tblaccounts` insert time against the InvoicePaid hook start: the row must be committed before the hooks
    (the fast path relies on it).
 2. Replay one signed notify 5x in parallel, inside the first ~100 ms and again inside the hook window: 1 row, all replies

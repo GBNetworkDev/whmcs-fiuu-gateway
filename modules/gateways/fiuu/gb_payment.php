@@ -17,8 +17,10 @@
  *  - Serialise per tranID with a MariaDB named lock (GET_LOCK) and do the "already recorded?" check inside the lock.
  *    The lock is tied to the DB connection, so it is released even if PHP dies. The lock name is scoped to the
  *    database and uses the same case-insensitive notion of "same tranID" as tblaccounts.transid.
- *  - The in-lock check is a locking read, so it sees the latest committed row even if the caller's connection has
- *    an open transaction (REPEATABLE READ snapshot). WHMCS normally runs in autocommit, where nothing changes.
+ *  - If the caller's connection has an open transaction (REPEATABLE READ snapshot), the in-lock checks are locking
+ *    reads so they see the latest committed row. WHMCS normally runs in autocommit, where plain reads are used.
+ *  - A lock timeout re-checks the table: a waiter whose holder already inserted the row (then sat in slow hooks) is a
+ *    duplicate, not "busy".
  *  - Write an "Accepted" gateway log BEFORE addInvoicePayment(), so every accepted payment is visible even if a hook
  *    fails, and write "Successful" only after the tblaccounts row is confirmed.
  *  - ignore_user_abort(true), and raise (never lower) the time limit to 600 s, so the request is not cut off if Fiuu
@@ -75,9 +77,31 @@ if (!function_exists('gbfiuu_record_payment')) {
         return !in_array($result, array('busy', 'not_recorded'), true);
     }
 
+    /** Discard anything WHMCS/hooks/PHP printed while recording, so the ack (302 / CBTOKEN) or 503 is the only output. */
+    function gbfiuu_discard_output($level)
+    {
+        while (ob_get_level() > $level) {
+            @ob_end_clean();
+        }
+    }
+
+    /** Tell Fiuu the payment is not recorded yet: HTTP 503, no 302, no CBTOKEN. */
+    function gbfiuu_respond_retry()
+    {
+        if (headers_sent($file, $line)) {
+            error_log("gbfiuu: headers already sent at $file:$line, cannot send HTTP 503");
+        } else {
+            http_response_code(503);
+        }
+        exit('RETRY');
+    }
+
     /** Count tblaccounts rows for a tranID. $locking = locking read (latest committed, ignores the caller's snapshot). */
     function gbfiuu_count_rows(PDO $pdo, $transid, $locking = false)
     {
+        // In autocommit a plain read already sees the latest committed row. Only an open transaction (REPEATABLE READ
+        // snapshot) needs the locking read, and only then, so no gap locks are taken in the normal case.
+        $locking = $locking && $pdo->inTransaction();
         $st = $pdo->prepare('SELECT COUNT(*) FROM tblaccounts WHERE transid = ?' . ($locking ? ' LOCK IN SHARE MODE' : ''));
         $st->execute(array($transid));
         return (int) $st->fetchColumn();
@@ -132,9 +156,15 @@ if (!function_exists('gbfiuu_record_payment')) {
         $st = $pdo->prepare('SELECT GET_LOCK(?, ?)');
         $st->execute(array($lock, $lockWait));
         if ((int) $st->fetchColumn() !== 1) {
-            // 0 = another request for the same tranID still holds the lock; NULL = error. Either way nothing was recorded.
-            $log($p['gatewayname'], $logData, 'Not recorded: same tranID is being processed (lock busy), Fiuu will retry');
-            $alert("Fiuu: tranID $transid for invoice #$invoiceid not recorded (lock busy), waiting for Fiuu retry");
+            // 0 = another request for the same tranID still holds the lock (usually busy in its InvoicePaid hooks after it
+            // already inserted the row); NULL = error. Look again before reporting "not recorded".
+            if (gbfiuu_count_rows($pdo, $transid) > 0) {
+                $log($p['gatewayname'], $logData, 'Already recorded (duplicate ignored)');
+                return 'duplicate';
+            }
+            $log($p['gatewayname'], $logData, 'Not recorded: same tranID is being processed (lock busy), asked Fiuu to retry');
+            $alert("Fiuu: tranID $transid for invoice #$invoiceid not recorded yet (lock busy). If it is still missing in 45 min, "
+                . "requery the tranID in the Fiuu portal and record the payment by hand");
             return 'busy';
         }
 
@@ -169,7 +199,7 @@ if (!function_exists('gbfiuu_record_payment')) {
                 $recorded = null; // cannot verify, e.g. the connection died inside a hook
             }
             if ($recorded === null) {
-                if ($error === null) {
+                if ($error === null && $returned !== false) {
                     // addInvoicePayment() returned normally, so WHMCS inserted and committed the row before its hooks.
                     $safe(function () use ($log, $p, $logData) {
                         $log($p['gatewayname'], $logData, 'Successful (not re-verified: DB connection lost)');
@@ -177,8 +207,10 @@ if (!function_exists('gbfiuu_record_payment')) {
                     return 'recorded';
                 }
                 // Unknown: let Fiuu retry; a retry is idempotent (fast path answers 'duplicate' if the row exists).
-                $safe(function () use ($alert, $transid, $invoiceid, $error) {
-                    $alert("Fiuu: tranID $transid for invoice #$invoiceid unverified after error: " . $error->getMessage());
+                $why = $error !== null ? $error->getMessage() : 'addInvoicePayment returned false';
+                $safe(function () use ($alert, $transid, $invoiceid, $why) {
+                    $alert("Fiuu: tranID $transid for invoice #$invoiceid unverified ($why, DB connection lost). Check the "
+                        . "invoice; if unpaid in 45 min, requery the tranID in the Fiuu portal and record it by hand");
                 });
                 return 'not_recorded';
             }
@@ -198,7 +230,8 @@ if (!function_exists('gbfiuu_record_payment')) {
             $why = $error !== null ? $error->getMessage() : ('addInvoicePayment returned ' . var_export($returned, true));
             $safe(function () use ($log, $alert, $p, $logData, $why, $transid, $invoiceid) {
                 $log($p['gatewayname'], $logData + array('gb_error' => $why), 'Not recorded: ' . $why);
-                $alert("Fiuu: tranID $transid for invoice #$invoiceid NOT recorded ($why), waiting for Fiuu retry");
+                $alert("Fiuu: tranID $transid for invoice #$invoiceid NOT recorded ($why). Fiuu was asked to retry; if still "
+                    . "unpaid in 45 min, requery the tranID in the Fiuu portal and record the payment by hand");
             });
             return 'not_recorded';
         } finally {
