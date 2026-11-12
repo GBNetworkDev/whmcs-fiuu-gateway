@@ -1,5 +1,20 @@
 # Changelog (GB Network fork)
 
+## gb-3 review fixes (2026-11-12, independent review of cb92a42)
+- Endpoints acknowledge Fiuu only when the payment is recorded: `busy` (lock timeout) and `not_recorded` (addInvoicePayment
+  threw before inserting, or returned false and wrote nothing) now answer **HTTP 503** with no 302/CBTOKEN, so Fiuu
+  retries instead of believing the payment went through. Callbacks now send `CBTOKEN:MPSTATOK` after processing (it was
+  sent before anything was recorded). The browser return still redirects the customer to the invoice.
+- "Successful" is logged only after the tblaccounts row is confirmed; `Accepted, recording payment` is logged before the
+  call. A hook failure after the insert is `error` (recorded, acknowledged) with an admin activity-log alert.
+- The in-lock duplicate check is a locking read (correct even if the caller's connection has an open transaction).
+- Lock name uses the case-insensitive tranID and the database name (MariaDB named locks are server-wide).
+- skey compared with `hash_equals` (constant time, rejects non-string input) in all 4 endpoints.
+- Deploy plan: `.htaccess` LiteSpeed rule mandatory until whmcs-einvoice#1 is live, outside the WHMCS block; lint and
+  `cmp` gb_payment.php too; rollback restores `.htaccess`; monitor groups by tranID only; staging checklist.
+- Tests: race_test 17/17 (new: case variants, open transaction, refused payment, hook error after insert, ack matrix);
+  new tests/endpoint_test.php, 17/17 over real HTTP (6 of them fail on cb92a42).
+
 ## gb-3 (2026-11-12, prepared, not deployed)
 ### Fixed
 - Same Fiuu tranID recorded twice (INV-1017315, tranID 4166432931; also 4 cases Aug-Sep 2026: invoices 147609,

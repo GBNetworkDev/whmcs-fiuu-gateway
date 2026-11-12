@@ -171,7 +171,7 @@ $res = run_parallel(2, function ($i) {
         array('pdo' => $pdo, 'addPayment' => $slowFirst, 'log' => function () {}, 'lockWait' => 1)
     );
 });
-check('waiter returns busy after lockWait, holder records once', $res === array('recorded', 'busy') && count_rows('SLOW') === 1, implode(',', $res));
+check('waiter returns busy after lockWait (not acked), holder records once', $res === array('recorded', 'busy') && !gbfiuu_should_ack('busy') && count_rows('SLOW') === 1, implode(',', $res));
 
 // 5b. Fast path: row already inserted, holder still in hooks (Bukku ~80 s in prod). A retry / browser return must answer
 //     'duplicate' at once, not sit on GET_LOCK for lockWait seconds.
@@ -192,19 +192,83 @@ $res = run_parallel(2, function ($i) {
 $waitSec = (float) substr($res[1], strpos($res[1], '@') + 1);
 check('retry during hooks returns duplicate at once (fast path), 1 row', strpos($res[0], 'recorded@') === 0 && strpos($res[1], 'duplicate@') === 0 && $waitSec < 1.0 && count_rows('INHOOKS') === 1, implode(',', $res));
 
-// 6. Log order: gateway log written BEFORE addInvoicePayment, so a crash inside hooks still leaves a log entry.
+// 6. Log order: "Accepted" is logged BEFORE addInvoicePayment, so a crash inside it still leaves a log entry. If it
+//    throws before the row exists, the result is not_recorded (no ack -> Fiuu retries), never "Successful".
 reset_table();
 $events = array();
 $pdo = db();
 $r = gbfiuu_record_payment(
     array('invoiceid' => 2, 'transid' => 'LOGFIRST', 'amount' => '1.00', 'gateway' => 'rms', 'gatewayname' => 'Fiuu', 'log' => array('tranID' => 'LOGFIRST')),
-    array('pdo' => $pdo, 'addPayment' => function () use (&$events) { $events[] = 'add'; throw new RuntimeException('hook died'); },
-        'log' => function ($n, $d, $result) use (&$events) { $events[] = 'log:' . $result; }, 'lockWait' => 1)
+    array('pdo' => $pdo, 'addPayment' => function () use (&$events) { $events[] = 'add'; throw new RuntimeException('db error before insert'); },
+        'log' => function ($n, $d, $result) use (&$events) { $events[] = 'log:' . $result; }, 'alert' => function () {}, 'lockWait' => 1)
 );
-check('log written before addInvoicePayment; hook exception is logged, not fatal', $r === 'error' && $events[0] === 'log:Successful' && $events[1] === 'add' && strpos($events[2], 'log:Error') === 0, implode(' > ', $events));
+check('accepted logged before addInvoicePayment; throw before insert -> not_recorded, no "Successful", no ack',
+    $r === 'not_recorded' && $events[0] === 'log:Accepted, recording payment' && $events[1] === 'add'
+    && strpos($events[2], 'log:Not recorded') === 0 && !in_array('log:Successful', $events, true) && !gbfiuu_should_ack($r),
+    implode(' > ', $events));
 
-// 7. Lock name fits MariaDB's 64-char limit.
-check('lock name <= 64 chars', strlen(gbfiuu_lock_name(str_repeat('9', 300))) <= 64);
+// 6b. Hook throws AFTER WHMCS inserted the row -> 'error' (payment is recorded), acknowledged, alert raised.
+reset_table();
+$events = array();
+$alerts = array();
+$pdo = db();
+$r = gbfiuu_record_payment(
+    array('invoiceid' => 4, 'transid' => 'HOOKFAIL', 'amount' => '1.00', 'gateway' => 'rms', 'gatewayname' => 'Fiuu', 'log' => array()),
+    array('pdo' => $pdo, 'addPayment' => function ($inv, $tid, $amt) use ($pdo) {
+        $pdo->prepare('INSERT INTO tblaccounts (invoiceid, transid, amountin, gateway) VALUES (?,?,?,?)')->execute(array($inv, $tid, $amt, 'rms'));
+        throw new RuntimeException('SolusVM hook TypeError');
+    }, 'log' => function ($n, $d, $result) use (&$events) { $events[] = $result; }, 'alert' => function ($m) use (&$alerts) { $alerts[] = $m; }, 'lockWait' => 1)
+);
+check('hook error after insert -> error, acked, logged + alert, 1 row',
+    $r === 'error' && gbfiuu_should_ack($r) && end($events) === 'Successful (hook error after recording)' && count($alerts) === 1 && count_rows('HOOKFAIL') === 1,
+    "$r " . implode(' > ', $events));
+
+// 6c. addInvoicePayment returns false (WHMCS refused, e.g. invoice cancelled) and wrote nothing -> not_recorded, no ack.
+reset_table();
+$events = array();
+$pdo = db();
+$r = gbfiuu_record_payment(
+    array('invoiceid' => 5, 'transid' => 'REFUSED', 'amount' => '1.00', 'gateway' => 'rms', 'gatewayname' => 'Fiuu', 'log' => array()),
+    array('pdo' => $pdo, 'addPayment' => function () { return false; },
+        'log' => function ($n, $d, $result) use (&$events) { $events[] = $result; }, 'alert' => function () {}, 'lockWait' => 1)
+);
+check('addInvoicePayment returns false -> not_recorded, never logged Successful', $r === 'not_recorded' && !in_array('Successful', $events, true)
+    && !gbfiuu_should_ack($r) && count_rows('REFUSED') === 0, "$r " . implode(' > ', $events));
+
+// 7. Lock name fits MariaDB's 64-char limit, ignores case/trailing spaces, and is scoped per database.
+check('lock name <= 64 chars', strlen(gbfiuu_lock_name(str_repeat('9', 300), str_repeat('d', 64))) <= 64);
+check('lock name: same for AB12 / ab12 / "ab12 ", different per database',
+    gbfiuu_lock_name('AB12', 'w') === gbfiuu_lock_name('ab12 ', 'w') && gbfiuu_lock_name('ab12', 'prod') !== gbfiuu_lock_name('ab12', 'staging'));
+
+// 7b. Case variants of one tranID at the same moment -> one row (they share the lock now).
+reset_table();
+$res = run_parallel(2, function ($i) {
+    $pdo = db();
+    return gbfiuu_record_payment(
+        array('invoiceid' => 6, 'transid' => $i ? 'AB12' : 'ab12', 'amount' => '1.00', 'gateway' => 'rms', 'gatewayname' => 'Fiuu', 'log' => array()),
+        array('pdo' => $pdo, 'addPayment' => fake_add_payment($pdo, 300), 'log' => function () {}, 'alert' => function () {}, 'lockWait' => 30)
+    );
+});
+check('case variants ab12 / AB12 at once -> exactly 1 row', count_rows('ab12') === 1, implode(',', $res));
+
+// 7c. Caller has an open transaction with a REPEATABLE READ snapshot taken before another request committed the row.
+//     The locking read inside the lock must still see it.
+reset_table();
+$pdo = db();
+$pdo->beginTransaction();
+$pdo->query('SELECT COUNT(*) FROM tblaccounts')->fetchColumn(); // snapshot taken here
+db()->prepare('INSERT INTO tblaccounts (invoiceid, transid, amountin, gateway) VALUES (7, ?, 1.00, "rms")')->execute(array('SNAPSHOT'));
+$r = gbfiuu_record_payment(
+    array('invoiceid' => 7, 'transid' => 'SNAPSHOT', 'amount' => '1.00', 'gateway' => 'rms', 'gatewayname' => 'Fiuu', 'log' => array()),
+    array('pdo' => $pdo, 'addPayment' => fake_add_payment($pdo, 0), 'log' => function () {}, 'alert' => function () {}, 'lockWait' => 1)
+);
+$pdo->commit();
+check('open transaction snapshot: in-lock locking read sees the committed row -> duplicate, 1 row', $r === 'duplicate' && count_rows('SNAPSHOT') === 1, "result=$r rows=" . count_rows('SNAPSHOT'));
+
+// 7d. Ack matrix used by the endpoints.
+check('should_ack: recorded/duplicate/error/invalid yes; busy/not_recorded no',
+    gbfiuu_should_ack('recorded') && gbfiuu_should_ack('duplicate') && gbfiuu_should_ack('error') && gbfiuu_should_ack('invalid')
+    && !gbfiuu_should_ack('busy') && !gbfiuu_should_ack('not_recorded'));
 
 // 8. Time limit is raised, never lowered (production runs with 700 s; 0 = unlimited stays unlimited).
 $orig = ini_get('max_execution_time');
@@ -230,7 +294,7 @@ try {
 } catch (\Throwable $e) {
     $r = 'exception: ' . $e->getMessage();
 }
-$free = (int) db()->query("SELECT IS_FREE_LOCK('" . gbfiuu_lock_name('CONNLOST') . "')")->fetchColumn();
+$free = (int) db()->query("SELECT IS_FREE_LOCK('" . gbfiuu_lock_name('CONNLOST', (string) db()->query('SELECT DATABASE()')->fetchColumn()) . "')")->fetchColumn();
 check('connection lost during hooks: result kept, lock freed, 1 row', $r === 'recorded' && $free === 1 && count_rows('CONNLOST') === 1, "$r free=$free");
 
 echo $fail ? "\n$fail FAILED\n" : "\nALL PASSED\n";

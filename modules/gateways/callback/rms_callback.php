@@ -42,7 +42,8 @@ if (isset($_SESSION['prev_skey']) && $_SESSION['prev_skey'] === $skey) {
  
  if($nbcb == 1)
 {
-	echo "CBTOKEN:MPSTATOK";
+	# GB patch 3: acknowledge Fiuu only after the payment is recorded (see the end of this file)
+	$gbfiuu_cb_ack = true;
 }
 else
 {
@@ -67,7 +68,7 @@ else
   $key0 = md5($tranID.$orderid.$status.$domain.$amount.$currency);
   $key1 = md5($paydate.$domain.$key0.$appcode.$passwd);
 
-  if ( $skey != $key1 ) $status = -1;
+  if (!is_string($skey) || !hash_equals($key1, $skey)) $status = -1; # GB patch 3: constant-time compare
 
  $viewinvoice = $CONFIG['SystemURL']."/viewinvoice.php?id=".$orderid;
  $clientarea = $CONFIG['SystemURL']."/clientarea.php?action=invoices";
@@ -82,7 +83,7 @@ if ($status=="00") {
     
     # --- GB Network patch 3: record each tranID once (lock + check inside the lock); see fiuu/gb_payment.php ---
     require_once __DIR__ . '/../fiuu/gb_payment.php';
-    gbfiuu_record_payment(array(
+    $gbfiuu_result = gbfiuu_record_payment(array(
         'invoiceid' => $invoiceid,
         'transid' => $transid,
         'amount' => $amount,
@@ -90,6 +91,15 @@ if ($status=="00") {
         'gatewayname' => $GATEWAY["name"],
         'log' => $_POST,
     ));
+    if (!gbfiuu_should_ack($gbfiuu_result)) {
+        # Not recorded yet: no CBTOKEN, so Fiuu retries the callback (up to 3 times, 15 min apart).
+        http_response_code(503);
+        exit("RETRY");
+    }
+    if (!empty($gbfiuu_cb_ack)) {
+        echo "CBTOKEN:MPSTATOK";
+        exit;
+    }
     # --- end GB Network patch 3 ---
     header('Location: '.$viewinvoice);
 	
@@ -97,6 +107,7 @@ if ($status=="00") {
 } else {
 	# Unsuccessful
     logTransaction($GATEWAY["name"],$_POST,"Unsuccessful");
+    if (!empty($gbfiuu_cb_ack)) { echo "CBTOKEN:MPSTATOK"; exit; } # GB patch 3: ack after processing
     header('Location: '.$clientarea);
 }
 
