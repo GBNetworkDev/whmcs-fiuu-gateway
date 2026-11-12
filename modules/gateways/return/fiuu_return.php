@@ -66,7 +66,7 @@ $nbcb = $_POST['nbcb'];
 $key0 = md5($tranID.$orderid.$status.$domain.$amount.$currency);
 $key1 = md5($paydate.$domain.$key0.$appcode.$passwd);
 
-if ( $skey != $key1 ) $status = -1;
+if (!is_string($skey) || !hash_equals($key1, $skey)) $status = -1; # GB patch 3: constant-time compare
 
 $viewinvoice = $CONFIG['SystemURL']."/viewinvoice.php?id=".$orderid;
 $clientarea = $CONFIG['SystemURL']."/clientarea.php?action=invoices";
@@ -78,16 +78,21 @@ $invoiceid = checkCbInvoiceID($orderid,$GATEWAY["name"]); # Checks invoice ID is
 if ($status=="00") {
     # Successful
     
-    $checkResult = select_query("tblaccounts", "COUNT(*)", array("transid" => $transid));
-    $checkData = mysql_fetch_array($checkResult);
-	
-    if ($checkData[0]) {
-	header("Location: ".$viewinvoice);
-	exit();
-    }
-    
-    addInvoicePayment($invoiceid,$transid,$amount,$fee,$gatewaymodule);
-    logTransaction($GATEWAY["name"],$_POST,"Successful");
+    # --- GB Network patch 3: record each tranID once (lock + check inside the lock); see fiuu/gb_payment.php ---
+    require_once __DIR__ . '/../fiuu/gb_payment.php';
+    $gbfiuu_ob = ob_get_level();
+    ob_start(); # GB patch 3: hook/WHMCS output must not precede the ack or the 503
+    $gbfiuu_result = gbfiuu_record_payment(array(
+        'invoiceid' => $invoiceid,
+        'transid' => $transid,
+        'amount' => $amount,
+        'gateway' => $gatewaymodule,
+        'gatewayname' => $GATEWAY["name"],
+        'log' => $_POST,
+    ));
+    gbfiuu_discard_output($gbfiuu_ob);
+    # Browser return: always send the customer to the invoice; the server notify/callback is authoritative.
+    # --- end GB Network patch 3 ---
     header('Location: '.$viewinvoice);
 	
 		

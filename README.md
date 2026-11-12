@@ -76,3 +76,8 @@ fresh `vcode`. The notify/return/callback files are unchanged.
 
 **Rollout:** copy `fiuu/config.php.example` to `fiuu/config.php`. Start with `mode => 'clients'` (test client only),
 then `all`. Delete `config.php` or set `off` to roll back instantly.
+
+## GB patch 3: one payment per tranID (prepared 2026-11-12)
+See `CHANGELOG.md` (gb-3) and `docs/gb-3-deploy-plan.md`. Files: `fiuu/gb_payment.php` (new) and the four endpoint
+files. Test: `tests/race_test.php`. The slow e_invoice hook behind the half-applied mass pay is fixed in
+GBNetworkDev/whmcs-einvoice#1, not in this repo.
