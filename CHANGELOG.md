@@ -10,7 +10,7 @@
 - Locking reads only inside an open transaction (no gap locks in autocommit). tblaccounts.transid is indexed in production.
 - Alerts tell staff what to do (requery in the Fiuu portal after 45 min). Deploy plan: run as a script, stage files
   outside the docroot, exact reload, rollback removes only the GB lines from .htaccess, staging results recorded.
-- Tests: race_test 20/20, endpoint_test 21/21 (random port, hook output, 503 retry with the same session cookie).
+- Tests: race_test 19/19, endpoint_test 21/21 (random port, hook output, 503 retry with the same session cookie).
 
 ## gb-3 review fixes (2026-11-12, independent review of cb92a42)
 - Endpoints acknowledge Fiuu only when the payment is recorded: `busy` (lock timeout) and `not_recorded` (addInvoicePayment
