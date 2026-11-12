@@ -78,16 +78,17 @@ $invoiceid = checkCbInvoiceID($orderid,$GATEWAY["name"]); # Checks invoice ID is
 if ($status=="00") {
     # Successful
     
-    $checkResult = select_query("tblaccounts", "COUNT(*)", array("transid" => $transid));
-    $checkData = mysql_fetch_array($checkResult);
-	
-    if ($checkData[0]) {
-	header("Location: ".$viewinvoice);
-	exit();
-    }
-    
-    addInvoicePayment($invoiceid,$transid,$amount,$fee,$gatewaymodule);
-    logTransaction($GATEWAY["name"],$_POST,"Successful");
+    # --- GB Network patch 3: record each tranID once (lock + check inside the lock); see fiuu/gb_payment.php ---
+    require_once __DIR__ . '/../fiuu/gb_payment.php';
+    gbfiuu_record_payment(array(
+        'invoiceid' => $invoiceid,
+        'transid' => $transid,
+        'amount' => $amount,
+        'gateway' => $gatewaymodule,
+        'gatewayname' => $GATEWAY["name"],
+        'log' => $_POST,
+    ));
+    # --- end GB Network patch 3 ---
     header('Location: '.$viewinvoice);
 	
 		
